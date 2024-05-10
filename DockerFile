@@ -1,0 +1,61 @@
+FROM zombbie/cuda11.1-cudnn8-ubuntu20.04:v1.0
+LABEL description="cuda 11.1" version="1.0" owner="yjyeh" maintainer="yjyeh"
+#ENV workspace /var/www/localhost/htdocs/
+ENV ENV_PATH $HOME/.visdom
+ENV LOGGING_LEVEL=INFO
+ENV HOSTNAME=localhost
+ENV BASE_URL=/
+ENV READONLY=True
+ENV ENABLE_LOGIN=False
+ENV FORCE_NEW_COOKIE=False
+ENV NO_PROXY="localhost,127.0.0.1"
+
+WORKDIR /
+
+COPY requirements.txt /708HDD2/yjyeh/
+RUN apt-get update \
+    && apt install -y swig \
+    && apt install -y libosmesa6-dev libgl1-mesa-glx libglfw3 \
+    && apt-get install patchelf \
+    && pip install pytorch-lightning==1.8 torch==1.13.0+cu117 torchvision==0.14.0+cu117 torchaudio==0.13.0 --extra-index-url https://download.pytorch.org/whl/cu117\
+    && pip install --default-timeout=1000 --no-cache-dir -r /708HDD2/yjyeh/requirements.txt \
+    #&& pip install numpy --upgrade \
+    #&& ln -s /usr/lib/x86_64-linux-gnu/libGL.so.1 /usr/lib/x86_64-linux-gnu/libGL.so  \
+    && mkdir -p /root/.mujoco \
+    && wget https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz -O mujoco.tar.gz \
+    && tar -xf mujoco.tar.gz -C /root/.mujoco \
+    && rm mujoco.tar.gz \
+    && ls /root
+
+
+ENV LD_LIBRARY_PATH /root/.mujoco/mujoco210/bin:${LD_LIBRARY_PATH}
+#ENV LD_LIBRARY_PATH /usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
+
+
+#RUN apt-get install -y libglew-dev
+#RUN apt install libopengl0 -y
+
+
+#RUN apk --update add apache2
+#RUN rm -rf /var/cache/apk/*
+#//708HDD2/yjyeh/project/hgnn_ppo_fjsp_2022/
+
+
+
+
+#RUN python -m visdom.server
+#EXPOSE 80
+#EXPOSE 8097
+#ENTRYPOINT ["httpd", "-D", "FOREGROUND"]
+
+
+#--entrypoint -v /708HDD2/yjyeh/project/gnn_drl_fjsp:/opt/project -v /708HDD2/yjyeh/static:/root/.visdom -p 8097:8097 --rm --gpus all
+
+#run options
+# 20231012
+# -v /708HDD2/yjyeh/static:/root/.visdom -p 8097:8097 --rm --gpus all
+
+# /home/yjyeh/.local/bin/tensorboard --logdir=runs
+
+#for Q-Pensieve input parameters
+#--env_id "MO_hopper-v0" --seed 1 --prefer 4 --buf_num 4 --q_freq 1000

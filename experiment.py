@@ -18,6 +18,10 @@ from torch import nn
 from state_norm_params import state_norm_params # we use normalization parameter for states from the behavioral policy
 import random
 
+#yeh added
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 isCloseToOne = lambda x: isclose(x, 1, rel_tol=1e-12)
 def pref_grid(n_obj, max_prefs=None, min_prefs=None, granularity=5):
     max_prefs = np.ones(n_obj) if max_prefs is None else max_prefs

@@ -3,6 +3,10 @@ import torch
 import time
 from tqdm import tqdm
 from modt.training.visualizer import visualize
+
+from torch.utils.tensorboard import SummaryWriter
+writer = SummaryWriter()
+
 class Trainer:
 
     def __init__(
@@ -48,8 +52,10 @@ class Trainer:
         self.logsdir = logsdir
         self.diagnostics = dict()
         self.start_time = time.time()
+        self.ep_count = 0
 
     def train_iteration(self, ep):
+        self.ep_count += 1
         train_losses = []
         logs = dict()
         train_start = time.time()
@@ -60,13 +66,15 @@ class Trainer:
                 train_losses.append(train_loss)
                 if self.scheduler is not None:
                     self.scheduler.step()
-                    
+
+            mean_loss = np.mean(train_losses)
+            writer.add_scalar("train/loss", mean_loss, self.ep_count)
+
 
         logs['time/training'] = time.time() - train_start
         eval_start = time.time()
         self.model.eval()
         cur_step = (ep+1) * self.n_steps_per_iter
-
 
         set_final_return, set_unweighted_raw_return, set_weighted_raw_return, set_cum_r_original = [], [], [], []
         for eval_fn in self.eval_fns:
@@ -79,6 +87,12 @@ class Trainer:
             for k, v in outputs.items():
                 logs[f'evaluation/{k}'] = v
 
+            # for i in range(unweighted_raw_returns)
+            mean_return = np.mean(unweighted_raw_returns, 0)
+            pref_str = np.array2string(eval_fn.target_pref, formatter={'float_kind': lambda x: "%.2f" % x}) + "/obj"
+            for i in range(mean_return.shape[0]):
+                writer.add_scalar("eval_" + pref_str + str(i), mean_return[i], self.ep_count)
+
 
         rollout_unweighted_raw_r = np.array(set_unweighted_raw_return)
         rollout_weighted_raw_r = np.array(set_weighted_raw_return)
@@ -86,8 +100,7 @@ class Trainer:
         target_prefs = np.array([eval_fn.target_pref for eval_fn in self.eval_fns])
         target_returns = np.array([eval_fn.target_reward for eval_fn in self.eval_fns]) # target returns are weighted
 
-        
-        
+
         n_obj = self.model.pref_dim
         # rollout_ratio = rollout_original_raw_r / np.sum(rollout_original_raw_r, axis=1, keepdims=True)
         rollout_logs = {

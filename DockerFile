@@ -9,6 +9,7 @@ ENV READONLY=True
 ENV ENABLE_LOGIN=False
 ENV FORCE_NEW_COOKIE=False
 ENV NO_PROXY="localhost,127.0.0.1"
+ENV TZ="Asia/Taipei"
 
 WORKDIR /
 

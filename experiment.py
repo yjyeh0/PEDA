@@ -12,11 +12,12 @@ from gym.spaces.box import Box
 import environments # import to register environments for multi-objective
 from math import isclose
 from modt.evaluation.evaluate_episodes import EvalEpisode
-from modt.training.loader import GetBatch
+
 from sklearn.linear_model import LinearRegression
 from torch import nn
 from state_norm_params import state_norm_params # we use normalization parameter for states from the behavioral policy
 import random
+from distutils.util import strtobool
 
 #yeh added
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -78,25 +79,34 @@ def experiment(
     use_max_rtg = variant['use_max_rtg']
     
     if model_type == 'dt':
+        from modt.training.loader import GetBatch
         from modt.training.seq_trainer import SequenceTrainer as Trainer
         from modt.evaluation.evaluator_dt import EvaluatorDT as Evaluator
         from modt.models.decision_transformer import DecisionTransformer as Model
     elif model_type == 'bc':
+        from modt.training.loader import GetBatch
         from modt.training.act_trainer import ActTrainer as Trainer
         from modt.evaluation.evaluator_bc import EvaluatorBC as Evaluator
         from modt.models.mlp_bc import MLPBCModel as Model
     elif model_type == 'rvs':
+        from modt.training.loader import GetBatch
         # from pytorch_lightning import Trainer
         from modt.training.rvs_trainer import RVSTrainer as Trainer
         from modt.evaluation.evaluator_rvs import EvaluatorRVS as Evaluator
         from rvs.src.rvs.policies import RvS as Model
-    
+    elif model_type == 'sac':
+        from sac.get_batch import GetBatch
+        from sac.sac_trainer import SACTrainer as Trainer
+        # yjyeh: todo
+        from sac.evaluator_sac import EvaluatorSAC as Evaluator
+        from sac.policy import SacAgent as Model
+
     if optimizer_name == "adam":
         from torch.optim import AdamW as Optimizer
     elif optimizer_name == "lamb":
         from modt.models.lamb import Lamb as Optimizer
-    
-    
+
+
     ckptdir = variant['dir'] + '/ckpt'
     logsdir = variant['dir'] + '/logs'
     if not os.path.exists(ckptdir):
@@ -110,11 +120,18 @@ def experiment(
     reward_size = env.obj_dim
     pref_dim = reward_size
     rtg_dim = pref_dim if mo_rtg else 1
-    scale = 100
+
+    if model_type != "sac":
+        scale = 100
+        if not normalize_reward:
+            scale *= 10
+    else:
+        scale = 1
+
     max_ep_len = 500
-    if not normalize_reward:
-        scale *= 10
-    
+
+
+
     # if using multiple dataset, load all at once
     dataset_paths = [f"data/{env_name}/{env_name}_50000_{d}.pkl" for d in dataset]
     trajectories = []
@@ -136,7 +153,9 @@ def experiment(
         traj['rewards'] = np.sum(np.multiply(traj['raw_rewards'], traj['preference']), axis=1)
         states.append(traj['observations'])
         traj_lens.append(len(traj['observations']))
+        # weighted return
         returns.append(traj['rewards'].sum())
+        # unweighted and seperated return
         returns_mo.append(traj['raw_rewards'].sum(axis=0))
         preferences.append(traj['preference'][0, :])
         
@@ -160,7 +179,7 @@ def experiment(
     state_std = np.concatenate((state_std, np.ones(concat_state_pref * pref_dim)))
     state_dim += pref_dim * concat_state_pref
         
-    
+
     lrModels = [LinearRegression() for _ in range(pref_dim)]
     for obj, lrModel in enumerate(lrModels):
         lrModel.fit(preferences.reshape((-1, pref_dim)), returns_mo[:, obj])
@@ -185,7 +204,8 @@ def experiment(
     get_batch = GetBatch(
         batch_size=batch_size,
         # RvS conditions on future avg return, always until the end of traj
-        max_len=K if model_type != 'rvs' else 1,
+        # max_len=K if model_type != 'rvs' else 1,
+        max_len=K if model_type not in ['rvs', 'sac'] else 1,
         max_ep_len=max_ep_len,
         num_trajectories=len(traj_lens),
         p_sample=p_sample,
@@ -292,36 +312,80 @@ def experiment(
         model.act_dim = act_dim
         model.pref_dim = pref_dim
         model.rtg_dim = rtg_dim
-    
-    optimizer = Optimizer(
-        model.parameters(),
-        lr=variant['learning_rate'],
-        weight_decay=variant['weight_decay'],
-    )
 
-    if variant['ckpt'] != '':
-        print(f'[Info] Loading ckpt from {variant["ckpt"]}')
-        ckpt = torch.load(variant['ckpt'])
-        model.load_state_dict(ckpt['model'])
-        optimizer.load_state_dict(ckpt['optimizer'])
+    elif model_type == "sac":
+        configs = {
+            'num_steps': 1500000,
+            'batch_size': args.batch_size,  # 256
+            'lr': 0.0003,
+            'hidden_units': [256, 256],
+            'memory_size': 1e6,
+            'prefer_num': args.prefer,
+            'buf_num': args.buf_num,
+            'gamma': 0.99,
+            'tau': 0.005,
+            'entropy_tuning': True,
+            'ent_coef': 0.2,  # It's ignored when entropy_tuning=True.
+            'multi_step': 1,
+            'per': False,  # prioritized experience replay
+            'alpha': 0.6,  # It's ignored when per=False.
+            'beta': 0.4,  # It's ignored when per=False.
+            'beta_annealing': 0.0001,  # It's ignored when per=False.
+            'grad_clip': None,
+            'updates_per_step': 1,
+            'start_steps': 10000,
+            'log_interval': 10,
+            'target_update_interval': 1,
+            'eval_interval': 50000,
+            'cuda': args.cuda,
+            'seed': args.seed,
+            'cuda_device': args.cuda_device,
+            'q_frequency': args.q_freq,
+            'model_saved_step': 100000
+        }
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda steps: min((steps+1)/warmup_steps, 1)
-    )
-    # default version only trains on action loss
-    if (not pref_loss) and (not return_loss):
-        loss_fn = lambda s_hat, a_hat, r_hat, pref_hat, s, a, r, pref: \
-            torch.mean((a_hat - a) ** 2)
-    # alternatively, can train on predicting preference
-    elif (not pref_loss) and return_loss:
-        loss_fn = lambda s_hat, a_hat, r_hat, pref_hat, s, a, r, pref: \
-            torch.mean((a_hat - a) ** 2) + torch.mean((r_hat - r) ** 2)
-    elif pref_loss and (not return_loss):
-        loss_fn = lambda s_hat, a_hat, r_hat, pref_hat, s, a, r, pref: \
-            torch.mean((a_hat - a) ** 2) + torch.mean((pref_hat - pref) ** 2)
+        model = Model(env=env, log_dir=variant['dir'], **configs)
+        # model = Model(env=env, log_dir=ckptdir, **configs)
+
+        # model.state_dim = state_dimevice=d
+        # model.act_dim = act_dim
+        # model.pref_dim = pref_dim
+        # model.rtg_dim = rtg_dim
+
+    if model_type != "sac":
+        optimizer = Optimizer(
+            model.parameters(),
+            lr=variant['learning_rate'],
+            weight_decay=variant['weight_decay'],
+        )
+
+        if variant['ckpt'] != '':
+            print(f'[Info] Loading ckpt from {variant["ckpt"]}')
+            ckpt = torch.load(variant['ckpt'])
+            model.load_state_dict(ckpt['model'])
+            optimizer.load_state_dict(ckpt['optimizer'])
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lambda steps: min((steps+1)/warmup_steps, 1)
+        )
+        # default version only trains on action loss
+        if (not pref_loss) and (not return_loss):
+            loss_fn = lambda s_hat, a_hat, r_hat, pref_hat, s, a, r, pref: \
+                torch.mean((a_hat - a) ** 2)
+        # alternatively, can train on predicting preference
+        elif (not pref_loss) and return_loss:
+            loss_fn = lambda s_hat, a_hat, r_hat, pref_hat, s, a, r, pref: \
+                torch.mean((a_hat - a) ** 2) + torch.mean((r_hat - r) ** 2)
+        elif pref_loss and (not return_loss):
+            loss_fn = lambda s_hat, a_hat, r_hat, pref_hat, s, a, r, pref: \
+                torch.mean((a_hat - a) ** 2) + torch.mean((pref_hat - pref) ** 2)
+        else:
+            loss_fn = lambda s_hat, a_hat, r_hat, pref_hat, s, a, r, pref: \
+                torch.mean((a_hat - a) ** 2) + torch.mean((r_hat - r) ** 2) + torch.mean((pref_hat - pref) ** 2)
     else:
-        loss_fn = lambda s_hat, a_hat, r_hat, pref_hat, s, a, r, pref: \
-            torch.mean((a_hat - a) ** 2) + torch.mean((r_hat - r) ** 2) + torch.mean((pref_hat - pref) ** 2)
+        optimizer = None
+        scheduler = None
+        loss_fn = None
     
     
 
@@ -367,10 +431,13 @@ def experiment(
         
         # save model
         filename = f'{ckptdir}/step={step}.ckpt'
-        torch.save({
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict()
-        }, filename)
+        if model_type != "sac":
+            torch.save({
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict()
+            }, filename)
+        else:
+            model.save_models(step)
         
         
         # save to wandb
@@ -389,7 +456,7 @@ if __name__ == '__main__':
     parser.add_argument('--K', type=int, default=20)
     parser.add_argument('--pct_traj', type=float, default=1.)
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--model_type', type=str, default='dt')  # dt, bc, rvs
+    parser.add_argument('--model_type', type=str, default='dt')  # dt, bc, rvs, sac
     parser.add_argument('--embed_dim', type=int, default=512)
     parser.add_argument('--n_layer', type=int, default=3) # lamb's default should be 4
     parser.add_argument('--n_head', type=int, default=1) # lamb's default should be 4
@@ -403,25 +470,33 @@ if __name__ == '__main__':
     parser.add_argument('--num_steps_per_iter', type=int, default=5000)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--dir', type=str, default='test_dir')
-    parser.add_argument('--log_to_wandb', type=bool, default=False)
+    parser.add_argument('--log_to_wandb', type=lambda x: bool(strtobool(x)), default=False)
     parser.add_argument('--wandb_group', type=str, default='none')
     parser.add_argument('--use_obj', type=int, default=-1) # decay to only 1-obj scenario. -1 default means nothing is decayed
     parser.add_argument('--percent_dt', type=float, default=1) # make DT to only use top% of data, default would be 99%
-    parser.add_argument('--use_pref_predict_action', type=bool, default=False)
+    parser.add_argument('--use_pref_predict_action', type=lambda x: bool(strtobool(x)), default=False)
     parser.add_argument('--concat_state_pref', type=int, default=0)
     parser.add_argument('--concat_rtg_pref', type=int, default=0)
     parser.add_argument('--concat_act_pref', type=int, default=0)
-    parser.add_argument('--normalize_reward', type=bool, default=False)
-    parser.add_argument('--mo_rtg', type=bool, default=False)
-    parser.add_argument('--eval_only', type=bool, default=False)
-    parser.add_argument('--return_loss', type=bool, default=False)
-    parser.add_argument('--pref_loss', type=bool, default=False)
+    parser.add_argument('--normalize_reward', type=lambda x: bool(strtobool(x)), default=False)
+    parser.add_argument('--mo_rtg', type=lambda x: bool(strtobool(x)), default=False)
+    parser.add_argument('--eval_only', type=lambda x: bool(strtobool(x)), default=False)
+    parser.add_argument('--return_loss', type=lambda x: bool(strtobool(x)), default=False)
+    parser.add_argument('--pref_loss', type=lambda x: bool(strtobool(x)), default=False)
     parser.add_argument('--optimizer', type=str, default="adam") # adam, lamb
     parser.add_argument('--eval_context_length', type=int, default=5)
     parser.add_argument('--rtg_scale', type=float, default=1)
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--granularity', type=int, default=1)
-    parser.add_argument('--use_max_rtg', type=bool, default=False)
+    parser.add_argument('--use_max_rtg', type=lambda x: bool(strtobool(x)), default=False)
+
+    # for sac
+    parser.add_argument('--cuda', action='store_true', default=True)
+    parser.add_argument('--cuda_device', type=int, default=0)
+    parser.add_argument('--prefer', type=int, default=4)
+    parser.add_argument('--buf_num', type=int, default=0)
+    parser.add_argument('--q_freq', type=int, default=1000)
+
     args = parser.parse_args()
     
 
@@ -429,15 +504,23 @@ if __name__ == '__main__':
     seed_everything(seed=seed)
     
     dataset_name = '_'.join(args.dataset)
-    
-    args.run_name = f"{args.dir}/{args.env}/{dataset_name}/K={args.K}/mo_rtg={args.mo_rtg}/rtg_scale={int(args.rtg_scale * 100)}/norm_rew={args.normalize_reward}/concat_state_pref={args.concat_state_pref}/concat_rtg_pref={args.concat_rtg_pref}/concat_act_pref={args.concat_act_pref}/percent={args.percent_dt}/batch={args.batch_size}/dim={args.embed_dim}/layers={args.n_layer}/obj={args.use_obj}/use_pref={args.use_pref_predict_action}/return_loss={args.return_loss}/pref_loss={args.pref_loss}/optim={args.optimizer}/seed={seed}"
 
-    if args.log_to_wandb:
-        wandb.init(
-            project=args.wandb_group,
-            entity="baitingz",
-            name=args.run_name
-        )
-    
-    args.dir = args.run_name
+    if args.model_type != "sac":
+        args.run_name = f"{args.dir}/{args.env}/{dataset_name}/K={args.K}/mo_rtg={args.mo_rtg}/rtg_scale={int(args.rtg_scale * 100)}/norm_rew={args.normalize_reward}/concat_state_pref={args.concat_state_pref}/concat_rtg_pref={args.concat_rtg_pref}/concat_act_pref={args.concat_act_pref}/percent={args.percent_dt}/batch={args.batch_size}/dim={args.embed_dim}/layers={args.n_layer}/obj={args.use_obj}/use_pref={args.use_pref_predict_action}/return_loss={args.return_loss}/pref_loss={args.pref_loss}/optim={args.optimizer}/seed={seed}"
+
+        if args.log_to_wandb:
+            wandb.init(
+                project=args.wandb_group,
+                entity="baitingz",
+                name=args.run_name
+            )
+
+
+        args.dir = args.run_name
+
+    else:
+        args.dir = os.path.join(
+            'logs', args.env,
+            f'MOSAC-set{args.prefer}-buf{args.buf_num}-seed{args.seed}_freq{args.q_freq}')
+
     experiment(variant=vars(args))

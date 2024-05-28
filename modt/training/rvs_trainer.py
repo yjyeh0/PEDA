@@ -25,3 +25,4 @@ class RVSTrainer(Trainer):
         self.optimizer.step()
 
         return loss.detach().cpu().item()
+
